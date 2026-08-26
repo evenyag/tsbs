@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import gzip
 import json
 import stat
 import sys
@@ -23,6 +24,8 @@ class DatasetIdentityTests(unittest.TestCase):
         self.assertEqual(generate.automatic_dataset_id(spec), generate.automatic_dataset_id(reordered))
         changed = dict(spec, scale=11)
         self.assertNotEqual(generate.automatic_dataset_id(spec), generate.automatic_dataset_id(changed))
+        self.assertEqual(generate.automatic_dataset_id(spec), generate.automatic_dataset_id(spec, "none"))
+        self.assertNotEqual(generate.automatic_dataset_id(spec), generate.automatic_dataset_id(spec, "gzip"))
 
     def test_dataset_selection_flags_are_mutually_exclusive(self) -> None:
         with self.assertRaises(SystemExit):
@@ -49,13 +52,38 @@ class DatasetIdentityTests(unittest.TestCase):
             first = parser.parse_args(
                 ["generate", "--format", "influx", "--dataset-root", temp, "--dataset-id", "shared", "--profile", "smoke"]
             )
-            _, created = generate.prepare_dataset(first)
+            dataset_dir, created = generate.prepare_dataset(first)
+            legacy = dict(created)
+            legacy.pop("compression")
+            generate.save_json(dataset_dir / "dataset.json", legacy)
             second = parser.parse_args(
                 ["generate", "--format", "influx", "--dataset-root", temp, "--dataset-id", "shared"]
             )
             _, reused = generate.prepare_dataset(second)
             self.assertEqual(reused["spec"], created["spec"])
             self.assertEqual(reused["spec"]["scale"], 10)
+            self.assertEqual(generate.manifest_compression(reused), "none")
+
+    def test_existing_dataset_inherits_compression_and_rejects_conflicts(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            parser = generate.make_parser()
+            first = parser.parse_args([
+                "prepare", "--dataset-root", temp, "--dataset-id", "shared",
+                "--profile", "smoke", "--compression", "gzip",
+            ])
+            generate.prepare_dataset(first)
+            inherited = parser.parse_args([
+                "generate", "--dataset-root", temp, "--dataset-id", "shared",
+                "--format", "influx",
+            ])
+            _, inherited_manifest = generate.prepare_dataset(inherited)
+            self.assertEqual(generate.manifest_compression(inherited_manifest), "gzip")
+            conflicting = parser.parse_args([
+                "generate", "--dataset-root", temp, "--dataset-id", "shared",
+                "--format", "influx", "--compression", "none",
+            ])
+            with self.assertRaisesRegex(generate.DatasetError, "conflicts"):
+                generate.prepare_dataset(conflicting)
 
     def test_prepare_creates_metadata_only_logical_dataset(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -76,7 +104,6 @@ class DatasetIdentityTests(unittest.TestCase):
             selected = generate.resolve_dataset_path(second, generate.logical_spec(second))
             self.assertTrue((selected / "dataset.json").is_file())
 
-
 class DatasetVariantTests(unittest.TestCase):
     def make_generator(self, root: Path, body: str) -> Path:
         script = root / "fake-generator"
@@ -84,10 +111,11 @@ class DatasetVariantTests(unittest.TestCase):
         script.chmod(script.stat().st_mode | stat.S_IXUSR)
         return script
 
-    def prepare(self, root: Path) -> tuple[Path, dict]:
-        args = generate.make_parser().parse_args(
-            ["generate", "--profile", "smoke", "--format", "influx", "--dataset-root", str(root)]
-        )
+    def prepare(self, root: Path, compression: str = "none") -> tuple[Path, dict]:
+        command = ["generate", "--profile", "smoke", "--format", "influx", "--dataset-root", str(root)]
+        if compression != "none":
+            command.extend(["--compression", compression])
+        args = generate.make_parser().parse_args(command)
         return generate.prepare_dataset(args)
 
     def test_multiple_formats_share_logical_dataset_and_reuse(self) -> None:
@@ -109,6 +137,16 @@ class DatasetVariantTests(unittest.TestCase):
             self.assertFalse(influx["reused"])
             self.assertTrue(reused["reused"])
             self.assertNotEqual(influx["sha256"], timescale["sha256"])
+
+    def test_gzip_output_is_deterministic(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            fake = self.make_generator(root, "print('valid payload')\n")
+            dataset_dir, manifest = self.prepare(root, "gzip")
+            with mock.patch.object(generate, "GENERATOR", fake):
+                first = generate.generate_variant(dataset_dir, manifest, "influx", compression="gzip", regenerate=False, rebuild=False)
+                second = generate.generate_variant(dataset_dir, manifest, "influx", compression="gzip", regenerate=True, rebuild=False)
+            self.assertEqual(first["artifact_sha256"], second["artifact_sha256"])
 
     def test_reuse_skips_checksum_verification(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -164,6 +202,28 @@ class DatasetVariantTests(unittest.TestCase):
                 ["verify", "--dataset-path", str(dataset_dir), "--format", "influx"]
             )
             with self.assertRaisesRegex(generate.DatasetError, "checksum mismatch"):
+                generate.verify_dataset(verify_args)
+
+    def test_verify_checks_decompressed_content_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            fake = self.make_generator(root, "print('valid')\n")
+            dataset_dir, manifest = self.prepare(root, "gzip")
+            with mock.patch.object(generate, "GENERATOR", fake):
+                result = generate.generate_variant(dataset_dir, manifest, "influx", compression="gzip", regenerate=False, rebuild=False)
+            artifact = Path(result["data_path"])
+            with artifact.open("wb") as raw:
+                with gzip.GzipFile(filename="", mode="wb", fileobj=raw, mtime=0) as stream:
+                    stream.write(b"other\n")
+            manifest_path = artifact.parent / "manifest.json"
+            variant = json.loads(manifest_path.read_text(encoding="utf-8"))
+            variant["artifact_bytes"] = artifact.stat().st_size
+            variant["artifact_sha256"] = generate.sha256_file(artifact)
+            manifest_path.write_text(json.dumps(variant), encoding="utf-8")
+            verify_args = generate.make_parser().parse_args([
+                "verify", "--dataset-path", str(dataset_dir), "--format", "influx", "--compression", "gzip",
+            ])
+            with self.assertRaisesRegex(generate.DatasetError, "content checksum mismatch"):
                 generate.verify_dataset(verify_args)
 
     def test_failed_regeneration_preserves_completed_artifact(self) -> None:

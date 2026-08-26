@@ -5,12 +5,16 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import gzip
 import hashlib
+import io
 import json
 import os
 import re
 import subprocess
 import sys
+import threading
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -25,8 +29,11 @@ DEFAULT_DATASET_ROOT = REPO_ROOT / ".benchmarks" / "datasets"
 GENERATOR = REPO_ROOT / "bin" / "tsbs_generate_data"
 GENERATOR_BUILD_METADATA = REPO_ROOT / "bin" / "tsbs_generate_data.build.json"
 SCHEMA_VERSION = 1
+VARIANT_SCHEMA_VERSION = 2
 FORMAT_RE = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
 ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+GO_DURATION_RE = re.compile(r"([0-9]+(?:\.[0-9]+)?)(ns|us|µs|ms|s|m|h)")
+COMPRESSIONS = ("none", "gzip")
 
 PROFILES = {
     "manual": {
@@ -52,6 +59,24 @@ class DatasetError(RuntimeError):
     """Raised for an actionable dataset error."""
 
 
+class HashingWriter:
+    """Track bytes and SHA-256 while forwarding a binary stream."""
+
+    def __init__(self, output: io.BufferedWriter):
+        self.output = output
+        self.bytes = 0
+        self.digest = hashlib.sha256()
+
+    def write(self, value: bytes) -> int:
+        written = self.output.write(value)
+        self.digest.update(value[:written])
+        self.bytes += written
+        return written
+
+    def flush(self) -> None:
+        self.output.flush()
+
+
 def utc_now() -> str:
     return dt.datetime.now(dt.timezone.utc).isoformat().replace("+00:00", "Z")
 
@@ -66,6 +91,47 @@ def sha256_file(path: Path) -> str:
         for chunk in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def parse_go_duration(value: str) -> int:
+    """Parse a positive Go duration and return nanoseconds."""
+    position = 0
+    total = Decimal(0)
+    units = {
+        "ns": Decimal(1),
+        "us": Decimal(1_000),
+        "µs": Decimal(1_000),
+        "ms": Decimal(1_000_000),
+        "s": Decimal(1_000_000_000),
+        "m": Decimal(60_000_000_000),
+        "h": Decimal(3_600_000_000_000),
+    }
+    try:
+        for match in GO_DURATION_RE.finditer(value):
+            if match.start() != position:
+                raise DatasetError(f"invalid Go duration: {value}")
+            total += Decimal(match.group(1)) * units[match.group(2)]
+            position = match.end()
+    except InvalidOperation as exc:
+        raise DatasetError(f"invalid Go duration: {value}") from exc
+    if position != len(value) or total <= 0 or total != total.to_integral_value():
+        raise DatasetError(f"invalid positive Go duration: {value}")
+    return int(total)
+
+
+def estimated_points(spec: dict[str, Any]) -> int | None:
+    if spec.get("use_case") != "cpu-only":
+        return None
+    try:
+        start = dt.datetime.fromisoformat(str(spec["start"]).replace("Z", "+00:00"))
+        end = dt.datetime.fromisoformat(str(spec["end"]).replace("Z", "+00:00"))
+    except (KeyError, ValueError) as exc:
+        raise DatasetError("dataset timestamps must be valid ISO-8601 values") from exc
+    elapsed = end - start
+    duration_ns = ((elapsed.days * 86_400 + elapsed.seconds) * 1_000_000_000) + elapsed.microseconds * 1_000
+    if duration_ns <= 0:
+        raise DatasetError("dataset end timestamp must be after start timestamp")
+    return int(spec["scale"]) * (duration_ns // parse_go_duration(str(spec["log_interval"])))
 
 
 def save_json(path: Path, value: Any) -> None:
@@ -104,8 +170,11 @@ def logical_spec(
     return spec
 
 
-def automatic_dataset_id(spec: dict[str, Any]) -> str:
-    digest = hashlib.sha256(canonical_json({"schema_version": SCHEMA_VERSION, "spec": spec}).encode()).hexdigest()
+def automatic_dataset_id(spec: dict[str, Any], compression: str = "none") -> str:
+    identity = {"schema_version": SCHEMA_VERSION, "spec": spec}
+    if compression != "none":
+        identity["compression"] = compression
+    digest = hashlib.sha256(canonical_json(identity).encode()).hexdigest()
     use_case = re.sub(r"[^a-z0-9]+", "-", str(spec["use_case"]).lower()).strip("-") or "data"
     return f"{use_case}-s{spec['scale']}-{digest[:12]}"
 
@@ -115,7 +184,11 @@ def dataset_root(args: argparse.Namespace) -> Path:
     return Path(configured).expanduser().resolve() if configured else DEFAULT_DATASET_ROOT
 
 
-def resolve_dataset_path(args: argparse.Namespace, spec: dict[str, Any] | None = None) -> Path:
+def resolve_dataset_path(
+    args: argparse.Namespace,
+    spec: dict[str, Any] | None = None,
+    compression: str = "none",
+) -> Path:
     if getattr(args, "dataset_path", None):
         return args.dataset_path.expanduser().resolve()
     dataset_id = getattr(args, "dataset_id", None)
@@ -123,7 +196,7 @@ def resolve_dataset_path(args: argparse.Namespace, spec: dict[str, Any] | None =
         if not ID_RE.fullmatch(dataset_id):
             raise DatasetError("--dataset-id may contain only letters, digits, '.', '_', and '-'")
     elif spec is not None:
-        dataset_id = automatic_dataset_id(spec)
+        dataset_id = automatic_dataset_id(spec, compression)
     else:
         raise DatasetError("provide --dataset-id or --dataset-path")
     return dataset_root(args) / dataset_id
@@ -140,42 +213,77 @@ def validate_dataset_manifest(dataset_dir: Path, expected_spec: dict[str, Any] |
         raise DatasetError(f"unsupported dataset schema in {dataset_dir / 'dataset.json'}")
     if not isinstance(manifest.get("spec"), dict):
         raise DatasetError(f"dataset manifest has no logical specification: {dataset_dir}")
+    if manifest.get("compression", "none") not in COMPRESSIONS:
+        raise DatasetError(f"unsupported dataset compression in {dataset_dir / 'dataset.json'}")
     if expected_spec is not None and manifest["spec"] != expected_spec:
         raise DatasetError(f"dataset settings do not match requested workload: {dataset_dir}")
     return manifest
 
 
+def manifest_compression(manifest: dict[str, Any]) -> str:
+    return str(manifest.get("compression", "none"))
+
+
+def variant_dir(dataset_dir: Path, format_name: str) -> Path:
+    return dataset_dir / "formats" / format_name
+
+
 def validate_variant(
     dataset_dir: Path,
     format_name: str,
+    compression: str = "none",
     *,
     verify_checksum: bool = True,
-) -> dict[str, Any]:
-    variant_dir = dataset_dir / "formats" / format_name
-    manifest = read_json(variant_dir / "manifest.json")
+) -> tuple[Path, dict[str, Any]]:
+    path = variant_dir(dataset_dir, format_name)
+    manifest = read_json(path / "manifest.json")
+    if manifest.get("schema_version") not in (SCHEMA_VERSION, VARIANT_SCHEMA_VERSION):
+        raise DatasetError(f"unsupported dataset format schema: {path / 'manifest.json'}")
     if manifest.get("status") != "completed":
-        raise DatasetError(f"dataset format variant is not complete: {variant_dir}")
+        raise DatasetError(f"dataset format variant is not complete: {path}")
     if manifest.get("format") != format_name:
-        raise DatasetError(f"dataset format manifest mismatch: {variant_dir}")
-    artifact = variant_dir / str(manifest.get("artifact", "data"))
+        raise DatasetError(f"dataset format manifest mismatch: {path}")
+    recorded_compression = manifest.get("compression", "none")
+    if recorded_compression != compression:
+        raise DatasetError(f"dataset compression manifest mismatch: {path}")
+    artifact = path / str(manifest.get("artifact", "data"))
     if not artifact.is_file():
         raise DatasetError(f"missing dataset artifact: {artifact}")
-    recorded_size = manifest.get("bytes")
-    recorded_checksum = manifest.get("sha256")
+    recorded_size = manifest.get("artifact_bytes", manifest.get("bytes"))
+    recorded_checksum = manifest.get("artifact_sha256", manifest.get("sha256"))
+    content_size = manifest.get("bytes")
+    content_checksum = manifest.get("sha256")
     if (
         isinstance(recorded_size, bool)
         or not isinstance(recorded_size, int)
         or recorded_size < 0
         or not isinstance(recorded_checksum, str)
         or re.fullmatch(r"[0-9a-f]{64}", recorded_checksum) is None
+        or isinstance(content_size, bool)
+        or not isinstance(content_size, int)
+        or content_size < 0
+        or not isinstance(content_checksum, str)
+        or re.fullmatch(r"[0-9a-f]{64}", content_checksum) is None
     ):
-        raise DatasetError(f"malformed dataset format manifest: {variant_dir}")
+        raise DatasetError(f"malformed dataset format manifest: {path}")
     actual_size = artifact.stat().st_size
     if actual_size != recorded_size:
         raise DatasetError(f"dataset artifact size mismatch: {artifact}")
     if verify_checksum and sha256_file(artifact) != recorded_checksum:
         raise DatasetError(f"dataset artifact checksum mismatch: {artifact}")
-    return manifest
+    if verify_checksum and compression == "gzip":
+        content_digest = hashlib.sha256()
+        content_bytes = 0
+        try:
+            with gzip.open(artifact, "rb") as stream:
+                for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                    content_digest.update(chunk)
+                    content_bytes += len(chunk)
+        except (gzip.BadGzipFile, EOFError, OSError) as exc:
+            raise DatasetError(f"invalid gzip dataset artifact: {artifact}") from exc
+        if content_bytes != manifest.get("bytes") or content_digest.hexdigest() != manifest.get("sha256"):
+            raise DatasetError(f"dataset content checksum mismatch: {artifact}")
+    return path, manifest
 
 
 def command_text(command: Sequence[str]) -> str:
@@ -238,25 +346,33 @@ def generate_variant(
     dataset_manifest: dict[str, Any],
     format_name: str,
     *,
+    compression: str = "none",
     regenerate: bool,
     rebuild: bool,
 ) -> dict[str, Any]:
     validate_format(format_name)
-    variant_dir = dataset_dir / "formats" / format_name
-    log_path = variant_dir / "generate.log"
-    artifact = variant_dir / "data"
-    manifest_path = variant_dir / "manifest.json"
+    if compression not in COMPRESSIONS:
+        raise DatasetError(f"unsupported compression: {compression}")
+    expected_compression = manifest_compression(dataset_manifest)
+    if compression != expected_compression:
+        raise DatasetError(
+            f"requested compression {compression} conflicts with dataset compression {expected_compression}"
+        )
+    path = variant_dir(dataset_dir, format_name)
+    log_path = path / "generate.log"
+    artifact = path / ("data.gz" if compression == "gzip" else "data")
+    manifest_path = path / "manifest.json"
     if manifest_path.exists() and not regenerate:
         existing = read_json(manifest_path)
         if existing.get("status") == "completed":
             if rebuild:
                 run_build(log_path, True)
-            manifest = validate_variant(
-                dataset_dir, format_name, verify_checksum=False
+            selected_dir, manifest = validate_variant(
+                dataset_dir, format_name, compression, verify_checksum=False
             )
-            return result(dataset_dir, dataset_manifest, manifest, reused=True)
+            return result(dataset_dir, dataset_manifest, selected_dir, manifest, reused=True)
 
-    variant_dir.mkdir(parents=True, exist_ok=True)
+    path.mkdir(parents=True, exist_ok=True)
     toolchain = run_build(log_path, rebuild)
     spec = dataset_manifest["spec"]
     command = [
@@ -276,28 +392,56 @@ def generate_variant(
         log.write(header)
         print(header, end="", file=sys.stderr)
         with temporary.open("wb") as output:
+            stored = HashingWriter(output)
+            content_digest = hashlib.sha256()
+            content_bytes = 0
             process = subprocess.Popen(
                 command,
                 cwd=REPO_ROOT,
-                stdout=output,
+                stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
-                text=True,
-                bufsize=1,
             )
+            assert process.stdout is not None
             assert process.stderr is not None
-            for line in process.stderr:
-                log.write(line)
-                sys.stderr.write(line)
-            process.stderr.close()
+
+            def drain_stderr() -> None:
+                for raw_line in iter(process.stderr.readline, b""):
+                    line = raw_line.decode("utf-8", errors="replace")
+                    log.write(line)
+                    log.flush()
+                    sys.stderr.write(line)
+                    sys.stderr.flush()
+
+            stderr_thread = threading.Thread(target=drain_stderr, daemon=True)
+            stderr_thread.start()
+            encoded: Any
+            if compression == "gzip":
+                encoded = gzip.GzipFile(filename="", mode="wb", fileobj=stored, compresslevel=6, mtime=0)
+            else:
+                encoded = stored
+            try:
+                for chunk in iter(lambda: process.stdout.read(1024 * 1024), b""):
+                    content_digest.update(chunk)
+                    content_bytes += len(chunk)
+                    encoded.write(chunk)
+            finally:
+                if compression == "gzip":
+                    encoded.close()
+                else:
+                    encoded.flush()
+            process.stdout.close()
             return_code = process.wait()
+            stderr_thread.join()
+            process.stderr.close()
     if return_code:
         temporary.unlink(missing_ok=True)
         if not artifact.exists():
             save_json(
                 manifest_path,
                 {
-                    "schema_version": SCHEMA_VERSION,
+                    "schema_version": VARIANT_SCHEMA_VERSION,
                     "format": format_name,
+                    "compression": compression,
                     "status": "failed",
                     "started_at": started_at,
                     "finished_at": utc_now(),
@@ -306,16 +450,17 @@ def generate_variant(
             )
         raise DatasetError(f"tsbs_generate_data failed with exit code {return_code}; see {log_path}")
 
-    checksum = sha256_file(temporary)
-    size = temporary.stat().st_size
     os.replace(temporary, artifact)
     manifest = {
-        "schema_version": SCHEMA_VERSION,
+        "schema_version": VARIANT_SCHEMA_VERSION,
         "format": format_name,
+        "compression": compression,
         "status": "completed",
-        "artifact": "data",
-        "bytes": size,
-        "sha256": checksum,
+        "artifact": artifact.name,
+        "bytes": content_bytes,
+        "sha256": content_digest.hexdigest(),
+        "artifact_bytes": stored.bytes,
+        "artifact_sha256": stored.digest.hexdigest(),
         "started_at": started_at,
         "finished_at": utc_now(),
         "log": "generate.log",
@@ -327,12 +472,13 @@ def generate_variant(
         },
     }
     save_json(manifest_path, manifest)
-    return result(dataset_dir, dataset_manifest, manifest, reused=False)
+    return result(dataset_dir, dataset_manifest, path, manifest, reused=False)
 
 
 def result(
     dataset_dir: Path,
     dataset_manifest: dict[str, Any],
+    variant_dir: Path,
     variant_manifest: dict[str, Any],
     *,
     reused: bool,
@@ -342,9 +488,13 @@ def result(
         "dataset_id": dataset_manifest["dataset_id"],
         "dataset_path": str(dataset_dir),
         "format": format_name,
-        "data_path": str(dataset_dir / "formats" / format_name / str(variant_manifest["artifact"])),
+        "compression": variant_manifest.get("compression", "none"),
+        "data_path": str(variant_dir / str(variant_manifest["artifact"])),
         "bytes": variant_manifest["bytes"],
         "sha256": variant_manifest["sha256"],
+        "artifact_bytes": variant_manifest.get("artifact_bytes", variant_manifest["bytes"]),
+        "artifact_sha256": variant_manifest.get("artifact_sha256", variant_manifest["sha256"]),
+        "estimated_points": estimated_points(dataset_manifest["spec"]),
         "spec": dataset_manifest["spec"],
         "reused": reused,
     }
@@ -355,6 +505,8 @@ def logical_result(dataset_dir: Path, dataset_manifest: dict[str, Any], *, reuse
     return {
         "dataset_id": dataset_manifest["dataset_id"],
         "dataset_path": str(dataset_dir),
+        "compression": manifest_compression(dataset_manifest),
+        "estimated_points": estimated_points(dataset_manifest["spec"]),
         "spec": dataset_manifest["spec"],
         "reused": reused,
     }
@@ -365,19 +517,27 @@ def prepare_dataset(args: argparse.Namespace) -> tuple[Path, dict[str, Any]]:
     dataset_dir = resolve_dataset_path(args) if explicit_selection else None
     if dataset_dir is not None and (dataset_dir / "dataset.json").exists():
         manifest = validate_dataset_manifest(dataset_dir)
+        requested_compression = getattr(args, "compression", None)
+        compression = manifest_compression(manifest)
+        if requested_compression is not None and requested_compression != compression:
+            raise DatasetError(
+                f"requested compression {requested_compression} conflicts with dataset compression {compression}"
+            )
         requested = logical_spec(args, manifest["spec"])
         if requested != manifest["spec"]:
             raise DatasetError(f"dataset settings do not match requested workload: {dataset_dir}")
         return dataset_dir, manifest
 
     spec = logical_spec(args)
-    dataset_dir = dataset_dir or resolve_dataset_path(args, spec)
+    compression = getattr(args, "compression", None) or "none"
+    dataset_dir = dataset_dir or resolve_dataset_path(args, spec, compression)
     manifest_path = dataset_dir / "dataset.json"
     dataset_dir.mkdir(parents=True, exist_ok=True)
     manifest = {
         "schema_version": SCHEMA_VERSION,
-        "dataset_id": args.dataset_id or automatic_dataset_id(spec),
+        "dataset_id": args.dataset_id or automatic_dataset_id(spec, compression),
         "created_at": utc_now(),
+        "compression": compression,
         "spec": spec,
     }
     save_json(manifest_path, manifest)
@@ -394,20 +554,22 @@ def list_datasets(args: argparse.Namespace) -> list[dict[str, Any]]:
             continue
         try:
             manifest = validate_dataset_manifest(path)
-            formats = []
+            compression = manifest_compression(manifest)
+            variants = []
             if (path / "formats").is_dir():
                 for child in sorted(path.joinpath("formats").iterdir()):
                     if not child.is_dir() or not (child / "manifest.json").is_file():
                         continue
-                    variant_manifest = read_json(child / "manifest.json")
-                    if variant_manifest.get("status") == "completed":
-                        formats.append(child.name)
+                    if read_json(child / "manifest.json").get("status") == "completed":
+                        variants.append({"format": child.name, "compression": compression})
             datasets.append(
                 {
                     "dataset_id": manifest.get("dataset_id", path.name),
                     "dataset_path": str(path.resolve()),
+                    "compression": compression,
                     "spec": manifest["spec"],
-                    "formats": formats,
+                    "formats": sorted({item["format"] for item in variants}),
+                    "variants": variants,
                 }
             )
         except DatasetError:
@@ -422,23 +584,32 @@ def select_existing(args: argparse.Namespace) -> tuple[Path, dict[str, Any]]:
 
 def verify_dataset(args: argparse.Namespace) -> dict[str, Any]:
     path, manifest = select_existing(args)
-    if args.format:
-        formats = [args.format]
-    else:
-        formats_dir = path / "formats"
-        formats = (
-            sorted(child.name for child in formats_dir.iterdir() if child.is_dir())
-            if formats_dir.exists()
-            else []
+    compression = manifest_compression(manifest)
+    if args.compression is not None and args.compression != compression:
+        raise DatasetError(
+            f"requested compression {args.compression} conflicts with dataset compression {compression}"
         )
-    if not formats:
+    selected: list[str] = []
+    formats_dir = path / "formats"
+    formats = [args.format] if args.format else (
+        sorted(child.name for child in formats_dir.iterdir() if child.is_dir()) if formats_dir.exists() else []
+    )
+    for format_name in formats:
+        if (variant_dir(path, format_name) / "manifest.json").is_file():
+            selected.append(format_name)
+    if not selected:
         raise DatasetError(f"dataset has no format variants: {path}")
     variants = []
-    for format_name in formats:
+    for format_name in selected:
         validate_format(format_name)
-        variant = validate_variant(path, format_name, verify_checksum=True)
-        variants.append(result(path, manifest, variant, reused=True))
-    return {"dataset_id": manifest["dataset_id"], "dataset_path": str(path), "variants": variants}
+        selected_dir, variant = validate_variant(path, format_name, compression, verify_checksum=True)
+        variants.append(result(path, manifest, selected_dir, variant, reused=True))
+    return {
+        "dataset_id": manifest["dataset_id"],
+        "dataset_path": str(path),
+        "compression": compression,
+        "variants": variants,
+    }
 
 
 def print_output(value: Any, as_json: bool) -> None:
@@ -450,9 +621,10 @@ def print_output(value: Any, as_json: bool) -> None:
             print(f"{item['dataset_id']}\t{','.join(item['formats'])}\t{item['dataset_path']}")
     elif isinstance(value, dict) and "data_path" in value:
         action = "reused" if value.get("reused") else "generated"
-        print(f"Dataset {action}: {value['dataset_id']} ({value['format']})")
+        print(f"Dataset {action}: {value['dataset_id']} ({value['format']}, {value['compression']})")
         print(f"Data: {value['data_path']}")
-        print(f"SHA-256: {value['sha256']}")
+        print(f"Content SHA-256: {value['sha256']}")
+        print(f"Artifact SHA-256: {value['artifact_sha256']}")
     else:
         print(json.dumps(value, indent=2, sort_keys=True))
 
@@ -476,6 +648,7 @@ def make_parser() -> argparse.ArgumentParser:
     add_selection_options(generate)
     generate.add_argument("--profile", choices=sorted(PROFILES))
     generate.add_argument("--format", required=True)
+    generate.add_argument("--compression", choices=COMPRESSIONS)
     generate.add_argument("--use-case")
     generate.add_argument("--start")
     generate.add_argument("--end")
@@ -491,6 +664,7 @@ def make_parser() -> argparse.ArgumentParser:
     add_root_options(prepare)
     add_selection_options(prepare)
     prepare.add_argument("--profile", choices=sorted(PROFILES))
+    prepare.add_argument("--compression", choices=COMPRESSIONS)
     prepare.add_argument("--use-case")
     prepare.add_argument("--start")
     prepare.add_argument("--end")
@@ -513,6 +687,7 @@ def make_parser() -> argparse.ArgumentParser:
     add_root_options(verify)
     add_selection_options(verify, required=True)
     verify.add_argument("--format")
+    verify.add_argument("--compression", choices=COMPRESSIONS)
     verify.add_argument("--json", action="store_true")
     return parser
 
@@ -530,15 +705,25 @@ def main(argv: Sequence[str] | None = None) -> int:
         validate_args(args)
         if args.command == "generate":
             path, manifest = prepare_dataset(args)
+            compression = manifest_compression(manifest)
+            point_count = estimated_points(manifest["spec"])
+            if point_count is not None and point_count >= 50_000_000 and compression == "none":
+                print(
+                    f"warning: dataset has an estimated {point_count:,} points; consider --compression gzip",
+                    file=sys.stderr,
+                )
             output = generate_variant(
                 path,
                 manifest,
                 args.format,
+                compression=compression,
                 regenerate=args.regenerate,
                 rebuild=args.rebuild,
             )
         elif args.command == "prepare":
-            selected_before = resolve_dataset_path(args, logical_spec(args))
+            selected_before = resolve_dataset_path(
+                args, logical_spec(args), args.compression or "none"
+            )
             existed = (selected_before / "dataset.json").is_file()
             path, manifest = prepare_dataset(args)
             output = logical_result(path, manifest, reused=existed)
@@ -546,7 +731,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             output = list_datasets(args)
         elif args.command == "inspect":
             path, manifest = select_existing(args)
-            output = {**manifest, "dataset_path": str(path)}
+            output = {
+                **manifest,
+                "compression": manifest_compression(manifest),
+                "dataset_path": str(path),
+            }
         else:
             output = verify_dataset(args)
         if getattr(args, "result_file", None):
