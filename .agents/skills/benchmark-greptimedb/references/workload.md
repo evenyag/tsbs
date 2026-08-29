@@ -10,6 +10,7 @@
 │   └── queries/<query-type>.dat
 └── greptimedb/
     ├── installations/<version>/<platform>/{manifest.json,greptime,...}
+    ├── configs/<descriptive-name>.toml
     ├── databases/<database-id>/{manifest.json,data/,logs/}
     ├── runs/<run-id>/
     │   ├── manifest.json
@@ -107,7 +108,9 @@ The database manifest's installation identity describes the version bound when
 the workspace was prepared or copied. A confirmed query-only override does not
 change it. The run target records the actual runtime version and checksum plus
 the workspace-bound identity, making separate runs safe to compare without
-rebinding metadata.
+rebinding metadata. A custom managed configuration records only its resolved
+live source path. Its contents are read again on every server start and are not
+copied or checksum-pinned by the runner.
 
 Copied workspaces retain the source dataset binding and record their origin,
 source manifest checksum, full-copy method, and copied file and byte counts.

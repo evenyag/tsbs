@@ -517,7 +517,31 @@ def managed_binary(args: argparse.Namespace, manifest: dict[str, Any]) -> Path:
     return args.greptime_bin.expanduser().resolve()
 
 
-def managed_target(args: argparse.Namespace, manifest: dict[str, Any], binary: Path) -> dict[str, Any]:
+def resolve_greptime_config(
+    args: argparse.Namespace,
+    existing_target: dict[str, Any] | None = None,
+) -> Path | None:
+    requested = getattr(args, "greptime_config", None)
+    recorded = (existing_target or {}).get("config_file")
+    path = requested.expanduser().resolve() if requested else Path(recorded) if recorded else None
+    if path is None:
+        return None
+    if not path.is_file():
+        raise BenchmarkError(f"GreptimeDB config file does not exist or is not a file: {path}")
+    try:
+        with path.open("rb"):
+            pass
+    except OSError as exc:
+        raise BenchmarkError(f"GreptimeDB config file is not readable: {path}") from exc
+    return path
+
+
+def managed_target(
+    args: argparse.Namespace,
+    manifest: dict[str, Any],
+    binary: Path,
+    config_file: Path | None = None,
+) -> dict[str, Any]:
     runtime_version = getattr(args, "greptime_version", None)
     if runtime_version:
         runtime_version = runtime_version.lstrip("v")
@@ -526,7 +550,7 @@ def managed_target(args: argparse.Namespace, manifest: dict[str, Any], binary: P
     workspace_version = manifest.get("version")
     workspace_checksum = manifest.get("binary_sha256")
     runtime_checksum = sha256_file(binary)
-    return {
+    target = {
         "mode": "managed",
         "endpoint": f"http://127.0.0.1:{args.http_port}",
         "database": args.database,
@@ -537,11 +561,16 @@ def managed_target(args: argparse.Namespace, manifest: dict[str, Any], binary: P
         "workspace_binary_sha256": workspace_checksum,
         "version_override": bool(runtime_version and workspace_version and runtime_version != workspace_version),
     }
+    if config_file is not None:
+        target["config_file"] = str(config_file)
+    return target
 
 
 def target_matches(existing: dict[str, Any], requested: dict[str, Any]) -> bool:
     if existing == requested:
         return True
+    if requested.get("config_file") is not None:
+        return False
     legacy_fields = {"mode", "endpoint", "database", "database_id", "version", "binary_sha256"}
     return not existing.keys() - legacy_fields and existing == {key: requested.get(key) for key in existing}
 
@@ -611,6 +640,7 @@ def run_analyses(
     workspace: Path,
     database_manifest: dict[str, Any],
     binary: Path,
+    config_file: Path | None = None,
 ) -> None:
     execution_count = 1 + args.hot_runs
     insufficient = {
@@ -676,7 +706,7 @@ def run_analyses(
             f"--results-file={metrics_path}",
         ]
         try:
-            with managed_process(args, workspace, binary, process_log):
+            with managed_process(args, workspace, binary, process_log, config_file):
                 run_tee(command, runner_log)
             expected = [cold_path, *hot_paths, metrics_path]
             missing = [path for path in expected if not path.is_file()]
@@ -719,19 +749,26 @@ def check_port_available(port: int, timeout: float = 5.0) -> None:
 def managed_workspace(
     args: argparse.Namespace,
     existing_target: dict[str, Any] | None = None,
-) -> Iterator[tuple[Path, dict[str, Any], Path, dict[str, Any]]]:
+) -> Iterator[tuple[Path, dict[str, Any], Path, Path | None, dict[str, Any]]]:
     workspace, database_manifest = prepare_database_workspace(args)
     with lock_database(workspace):
         binary = managed_binary(args, database_manifest)
-        target = managed_target(args, database_manifest, binary)
+        config_file = resolve_greptime_config(args, existing_target)
+        target = managed_target(args, database_manifest, binary, config_file)
         if existing_target and not target_matches(existing_target, target):
             raise BenchmarkError("run target is immutable; create a new run for another GreptimeDB version or target")
         if not binary.is_file() or not os.access(binary, os.X_OK): raise BenchmarkError(f"GreptimeDB binary is not executable: {binary}")
-        yield workspace, database_manifest, binary, target
+        yield workspace, database_manifest, binary, config_file, target
 
 
 @contextlib.contextmanager
-def managed_process(args: argparse.Namespace, workspace: Path, binary: Path, process_log_path: Path) -> Iterator[str]:
+def managed_process(
+    args: argparse.Namespace,
+    workspace: Path,
+    binary: Path,
+    process_log_path: Path,
+    config_file: Path | None = None,
+) -> Iterator[str]:
     process_log_path.parent.mkdir(parents=True, exist_ok=True)
     process_log = process_log_path.open("a", encoding="utf-8")
     try:
@@ -742,6 +779,8 @@ def managed_process(args: argparse.Namespace, workspace: Path, binary: Path, pro
         raise
     endpoint = f"http://127.0.0.1:{args.http_port}"
     command = [str(binary), "standalone", "start", "--http-addr", f"127.0.0.1:{args.http_port}", "--influxdb-enable", "--data-home", str(workspace / "data"), "--log-dir", str(workspace / "logs")]
+    if config_file is not None:
+        command.extend(["--config-file", str(config_file)])
     process_log.write(f"$ {display_command(command)}\n")
     process_log.flush()
     try:
@@ -766,16 +805,19 @@ def managed_process(args: argparse.Namespace, workspace: Path, binary: Path, pro
 
 
 @contextlib.contextmanager
-def connection(args: argparse.Namespace, run_dir: Path, existing_target: dict[str, Any] | None = None) -> Iterator[tuple[str, bool, dict[str, Any] | None, Path | None, dict[str, Any]]]:
+def connection(args: argparse.Namespace, run_dir: Path, manifest: dict[str, Any]) -> Iterator[tuple[str, bool, dict[str, Any] | None, Path | None]]:
+    existing_target = manifest.get("target")
     if args.endpoint:
         endpoint = args.endpoint.rstrip("/")
         target = {"mode": "external", "endpoint": endpoint, "database": args.database, "database_id": None, "version": None, "binary_sha256": None}
         if existing_target and not target_matches(existing_target, target):
             raise BenchmarkError("run target is immutable; create a new run for another GreptimeDB version or target")
-        yield endpoint, False, None, None, target; return
-    with managed_workspace(args, existing_target) as (workspace, database_manifest, binary, target):
-        with managed_process(args, workspace, binary, run_dir / "logs" / "greptimedb-process.log") as endpoint:
-            yield endpoint, True, database_manifest, workspace, target
+        manifest["target"] = target; save_manifest(run_dir, manifest)
+        yield endpoint, False, None, None; return
+    with managed_workspace(args, existing_target) as (workspace, database_manifest, binary, config_file, target):
+        manifest["target"] = target; save_manifest(run_dir, manifest)
+        with managed_process(args, workspace, binary, run_dir / "logs" / "greptimedb-process.log", config_file) as endpoint:
+            yield endpoint, True, database_manifest, workspace
 
 
 def add_run_options(parser: argparse.ArgumentParser) -> None:
@@ -788,7 +830,7 @@ def add_run_options(parser: argparse.ArgumentParser) -> None:
 
 
 def add_connection_options(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--greptime-bin", type=Path); parser.add_argument("--endpoint"); parser.add_argument("--http-port", type=int, default=4000); parser.add_argument("--startup-timeout", type=int, default=60); parser.add_argument("--database", help=f"SQL database name (default: {DEFAULT_DATABASE})"); parser.add_argument("--database-id"); parser.add_argument("--database-root", type=Path)
+    parser.add_argument("--greptime-bin", type=Path); parser.add_argument("--greptime-config", type=Path, metavar="PATH", help="live GreptimeDB standalone TOML config for managed targets"); parser.add_argument("--endpoint"); parser.add_argument("--http-port", type=int, default=4000); parser.add_argument("--startup-timeout", type=int, default=60); parser.add_argument("--database", help=f"SQL database name (default: {DEFAULT_DATABASE})"); parser.add_argument("--database-id"); parser.add_argument("--database-root", type=Path)
 
 
 def add_version_override_options(parser: argparse.ArgumentParser) -> None:
@@ -830,7 +872,10 @@ def validate_args(args: argparse.Namespace) -> None:
         if value and not ID_RE.fullmatch(value): raise BenchmarkError(f"--{name.replace('_', '-')} contains invalid characters")
     if args.command in ("load", "query", "analyze", "all"):
         greptime_version = getattr(args, "greptime_version", None)
-        if args.endpoint and (args.greptime_bin or args.database_id or greptime_version): raise BenchmarkError("external GreptimeDB cannot use managed binary or database options")
+        greptime_config = getattr(args, "greptime_config", None)
+        if args.endpoint and (args.greptime_bin or args.database_id or greptime_version or greptime_config): raise BenchmarkError("external GreptimeDB cannot use managed binary, config, or database options")
+        if greptime_config:
+            resolve_greptime_config(args)
         if not args.endpoint and not args.database_id: raise BenchmarkError("provide --database-id for managed GreptimeDB or --endpoint for external GreptimeDB")
         if args.endpoint and args.database_id: raise BenchmarkError("--database-id is only valid with managed GreptimeDB")
         if greptime_version and args.greptime_bin: raise BenchmarkError("--greptime-version cannot be combined with --greptime-bin")
@@ -862,14 +907,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             if args.only in ("all", "data"): generate_data(args, run_dir, manifest)
             if args.only in ("all", "queries"): generate_queries(args, run_dir, manifest)
         elif args.command in ("load", "query", "all"):
-            with connection(args, run_dir, manifest.get("target")) as (endpoint, managed, database_manifest, database_path, target):
-                manifest["target"] = target; save_manifest(run_dir, manifest)
+            with connection(args, run_dir, manifest) as (endpoint, managed, database_manifest, database_path):
                 if args.command in ("load", "all"): load_data(args, run_dir, manifest, endpoint, managed, database_manifest, database_path)
                 if args.command in ("query", "all"): run_queries(args, run_dir, manifest, endpoint, database_manifest)
         elif args.command == "analyze":
-            with managed_workspace(args, manifest.get("target")) as (workspace, database_manifest, binary, target):
+            with managed_workspace(args, manifest.get("target")) as (workspace, database_manifest, binary, config_file, target):
                 manifest["target"] = target; save_manifest(run_dir, manifest)
-                run_analyses(args, run_dir, manifest, workspace, database_manifest, binary)
+                run_analyses(args, run_dir, manifest, workspace, database_manifest, binary, config_file)
         summary = write_summary(run_dir, manifest); print(f"Run directory: {run_dir}"); print(f"Summary: {run_dir / 'summary.md'}"); return 1 if summary["failures"] else 0
     except (BenchmarkError, ComparisonError, TsbsEnvironmentError, OSError, ValueError, json.JSONDecodeError, KeyError, TypeError) as exc:
         if run_dir is not None and manifest is not None:

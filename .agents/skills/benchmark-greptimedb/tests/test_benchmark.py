@@ -55,7 +55,10 @@ class SummaryIntegrationTests(unittest.TestCase):
                     "run_id": "run",
                     "profile": "smoke",
                     "database": "benchmark",
-                    "target": {"mode": "managed", "database_id": "db-a", "version": "1.1.4", "binary_sha256": "def"},
+                    "target": {
+                        "mode": "managed", "database_id": "db-a", "version": "1.1.4",
+                        "binary_sha256": "def", "config_file": "/configs/scan.toml",
+                    },
                     "dataset": {"dataset_id": "data-a"},
                     "query_set": {
                         "query_set_id": "set-a",
@@ -69,6 +72,7 @@ class SummaryIntegrationTests(unittest.TestCase):
         self.assertIn("managed:db-a", rendered)
         self.assertIn("GreptimeDB version: `1.1.4`", rendered)
         self.assertIn("GreptimeDB binary SHA-256: `def`", rendered)
+        self.assertIn("GreptimeDB config file: `/configs/scan.toml`", rendered)
         self.assertIn("set-a", rendered)
 
     def test_version_override_identity_is_rendered(self) -> None:
@@ -107,7 +111,7 @@ class QuerySetIdentityTests(unittest.TestCase):
 
 
 class VersionComparisonTests(unittest.TestCase):
-    def make_run(self, root: Path, name: str, version: str, means: dict[str, float], *, dataset_id: str = "data-a") -> Path:
+    def make_run(self, root: Path, name: str, version: str, means: dict[str, float], *, dataset_id: str = "data-a", config_file: str | None = None) -> Path:
         run_dir = root / name; (run_dir / "results").mkdir(parents=True); (run_dir / "logs").mkdir()
         query_counts = {query_type: 10 for query_type in means}
         events = []
@@ -120,11 +124,14 @@ class VersionComparisonTests(unittest.TestCase):
                 "log": f"logs/{query_type}.log", "results": f"results/{query_type}.json",
                 "status": "completed",
             })
+        target = {"mode": "managed", "database_id": f"db-{version}", "version": version, "binary_sha256": version * 4}
+        if config_file:
+            target["config_file"] = config_file
         manifest = {
             "schema_version": 1, "kind": "greptimedb-run", "run_id": name,
             "created_at": benchmark.utc_now(), "profile": "manual", "database": "benchmark",
             "workload": {"query_counts": query_counts},
-            "target": {"mode": "managed", "database_id": f"db-{version}", "version": version, "binary_sha256": version * 4},
+            "target": target,
             "dataset": {"dataset_id": dataset_id, "spec": {"scale": 10}, "format": "influx", "bytes": 100, "sha256": "d" * 64},
             "query_set": {"query_set_id": "set-a", "manifest_sha256": "q" * 64, "spec": {"query_counts": query_counts}},
             "events": {"loads": [], "queries": events},
@@ -172,6 +179,19 @@ class VersionComparisonTests(unittest.TestCase):
             query = json.loads((output / "summary.json").read_text())["candidates"][0]["queries"][0]
             self.assertIsNone(query["delta_percent"])
             self.assertIsNone(query["latency_ratio"])
+
+    def test_allows_and_reports_different_config_files(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            baseline = self.make_run(root, "baseline", "1.1.4", {"lastpoint": 10.0}, config_file="/configs/default.toml")
+            candidate = self.make_run(root, "candidate", "1.0.0", {"lastpoint": 12.0}, config_file="/configs/tuned.toml")
+            output = version_compare.create_comparison(baseline, [candidate], root / "comparisons")
+            summary = json.loads((output / "summary.json").read_text())
+            self.assertEqual(summary["baseline"]["config_file"], "/configs/default.toml")
+            self.assertEqual(summary["candidates"][0]["config_file"], "/configs/tuned.toml")
+            rendered = (output / "summary.md").read_text()
+            self.assertIn("Baseline GreptimeDB config: `/configs/default.toml`", rendered)
+            self.assertIn("Candidate GreptimeDB config: `/configs/tuned.toml`", rendered)
 
 
 class WorkspaceTests(unittest.TestCase):
@@ -415,13 +435,15 @@ class AnalyzeTests(unittest.TestCase):
             query_counts = {"lastpoint": 3, "cpu-max-all-1": 3}
             manifest = self.manifest(query_counts)
             args = self.args(run_dir)
+            config_file = Path(temp) / "standalone.toml"
+            config_file.write_text("max_concurrent_queries = 1\n", encoding="utf-8")
             starts = []
 
             @contextlib.contextmanager
-            def process(_args, _workspace, _binary, log_path):
+            def process(_args, _workspace, _binary, log_path, _config_file=None):
                 log_path.parent.mkdir(parents=True, exist_ok=True)
                 log_path.write_text("server started\n", encoding="utf-8")
-                starts.append(log_path)
+                starts.append(_config_file)
                 yield "http://127.0.0.1:4000"
 
             patches = (
@@ -433,10 +455,11 @@ class AnalyzeTests(unittest.TestCase):
                 mock.patch.object(benchmark, "run_tee", side_effect=self.execute),
             )
             with patches[0], patches[1], patches[2], patches[3], patches[4], patches[5] as runner:
-                benchmark.run_analyses(args, run_dir, manifest, Path(temp), {"binding": {}}, Path("/greptime"))
-                benchmark.run_analyses(args, run_dir, manifest, Path(temp), {"binding": {}}, Path("/greptime"))
+                benchmark.run_analyses(args, run_dir, manifest, Path(temp), {"binding": {}}, Path("/greptime"), config_file)
+                benchmark.run_analyses(args, run_dir, manifest, Path(temp), {"binding": {}}, Path("/greptime"), config_file)
 
             self.assertEqual(len(starts), 4)
+            self.assertEqual(starts, [config_file] * 4)
             self.assertEqual(runner.call_count, 4)
             self.assertEqual([event["attempt"] for event in manifest["events"]["analyses"]], [1, 1, 2, 2])
             for query_type in query_counts:
@@ -613,6 +636,127 @@ class ManagedDatabaseTests(unittest.TestCase):
         benchmark.resolve_database(args)
         with self.assertRaisesRegex(benchmark.BenchmarkError, "database-id"):
             benchmark.validate_args(args)
+
+    def test_config_file_is_validated_and_reused_by_path(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            config_a = root / "a.toml"; config_a.write_text("max_concurrent_queries = 1\n", encoding="utf-8")
+            config_b = root / "b.toml"; config_b.write_text("max_concurrent_queries = 2\n", encoding="utf-8")
+            binary = root / "greptime"; binary.write_text("binary", encoding="utf-8")
+            parser = benchmark.make_parser()
+            args = parser.parse_args([
+                "query", "--greptime-bin", "/bin/true", "--database-id", "db-a",
+                "--greptime-config", str(config_a),
+            ])
+            benchmark.resolve_database(args); benchmark.validate_args(args)
+            resolved = benchmark.resolve_greptime_config(args)
+            self.assertEqual(resolved, config_a.resolve())
+            manifest = {"database_id": "db-a", "database": "benchmark", "binding": None}
+            target = benchmark.managed_target(args, manifest, binary, resolved)
+            self.assertEqual(target["config_file"], str(config_a.resolve()))
+
+            resumed = parser.parse_args(["query", "--greptime-bin", "/bin/true", "--database-id", "db-a"])
+            benchmark.resolve_database(resumed)
+            self.assertEqual(benchmark.resolve_greptime_config(resumed, target), config_a.resolve())
+            config_a.write_text("max_concurrent_queries = 3\n", encoding="utf-8")
+            self.assertEqual(benchmark.resolve_greptime_config(resumed, target), config_a.resolve())
+
+            changed = parser.parse_args([
+                "query", "--greptime-bin", "/bin/true", "--database-id", "db-a",
+                "--greptime-config", str(config_b),
+            ])
+            benchmark.resolve_database(changed)
+            changed_target = benchmark.managed_target(
+                changed, manifest, binary, benchmark.resolve_greptime_config(changed, target)
+            )
+            self.assertFalse(benchmark.target_matches(target, changed_target))
+            legacy_target = {key: target[key] for key in ("mode", "endpoint", "database", "database_id", "version", "binary_sha256")}
+            self.assertFalse(benchmark.target_matches(legacy_target, target))
+
+    def test_connection_persists_config_before_startup_failure_and_reuses_it(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp); run_dir = root / "run"; (run_dir / "logs").mkdir(parents=True)
+            config = root / "standalone.toml"; config.write_text("max_concurrent_queries = 1\n", encoding="utf-8")
+            database_root = root / "databases"
+            parser = benchmark.make_parser()
+            args = parser.parse_args([
+                "query", "--greptime-bin", sys.executable, "--database-id", "db-a",
+                "--database-root", str(database_root), "--greptime-config", str(config),
+            ])
+            benchmark.resolve_database(args); benchmark.validate_args(args)
+            manifest = {"events": {"loads": [], "queries": [], "analyses": []}}
+            benchmark.save_manifest(run_dir, manifest)
+
+            with mock.patch.object(
+                benchmark, "managed_process", side_effect=benchmark.BenchmarkError("startup failed")
+            ) as process:
+                with self.assertRaisesRegex(benchmark.BenchmarkError, "startup failed"):
+                    with benchmark.connection(args, run_dir, manifest):
+                        pass
+
+            resolved_config = config.resolve()
+            self.assertEqual(process.call_args.args[4], resolved_config)
+            saved = benchmark.read_json(run_dir / "manifest.json")
+            self.assertEqual(saved["target"]["config_file"], str(resolved_config))
+
+            resumed = parser.parse_args([
+                "query", "--greptime-bin", sys.executable, "--database-id", "db-a",
+                "--database-root", str(database_root),
+            ])
+            benchmark.resolve_database(resumed); benchmark.validate_args(resumed)
+            with mock.patch.object(
+                benchmark, "managed_process", side_effect=benchmark.BenchmarkError("startup failed again")
+            ) as resumed_process:
+                with self.assertRaisesRegex(benchmark.BenchmarkError, "startup failed again"):
+                    with benchmark.connection(resumed, run_dir, saved):
+                        pass
+
+            self.assertEqual(resumed_process.call_args.args[4], resolved_config)
+            self.assertEqual(benchmark.read_json(run_dir / "manifest.json")["target"]["config_file"], str(resolved_config))
+
+    def test_config_file_rejects_invalid_paths_and_external_targets(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            parser = benchmark.make_parser()
+            missing = parser.parse_args([
+                "query", "--database-id", "db-a", "--greptime-config", str(root / "missing.toml"),
+            ])
+            benchmark.resolve_database(missing)
+            with self.assertRaisesRegex(benchmark.BenchmarkError, "does not exist"):
+                benchmark.validate_args(missing)
+
+            config = root / "config.toml"; config.write_text("max_concurrent_queries = 1\n", encoding="utf-8")
+            external = parser.parse_args([
+                "query", "--endpoint", "http://localhost:4000", "--greptime-config", str(config),
+            ])
+            benchmark.resolve_database(external)
+            with self.assertRaisesRegex(benchmark.BenchmarkError, "external GreptimeDB"):
+                benchmark.validate_args(external)
+
+    def test_managed_process_passes_config_and_managed_overrides(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp); workspace = root / "workspace"; workspace.mkdir()
+            config = root / "config.toml"; config.write_text("[http]\naddr = \"0.0.0.0:9000\"\n", encoding="utf-8")
+            args = benchmark.make_parser().parse_args([
+                "query", "--database-id", "db-a", "--http-port", "4100",
+            ])
+            process = mock.Mock(pid=1234)
+            process.poll.return_value = None
+            process.wait.return_value = 0
+            with mock.patch.object(benchmark, "check_port_available"), mock.patch.object(
+                benchmark, "endpoint_ready", return_value=True
+            ), mock.patch.object(benchmark.subprocess, "Popen", return_value=process) as popen, mock.patch.object(
+                benchmark.os, "killpg"
+            ):
+                with benchmark.managed_process(args, workspace, Path("/greptime"), root / "process.log", config):
+                    pass
+            command = popen.call_args.args[0]
+            self.assertIn("--config-file", command)
+            self.assertEqual(command[command.index("--config-file") + 1], str(config))
+            self.assertEqual(command[command.index("--http-addr") + 1], "127.0.0.1:4100")
+            self.assertEqual(command[command.index("--data-home") + 1], str(workspace / "data"))
+            self.assertEqual(command[command.index("--log-dir") + 1], str(workspace / "logs"))
+            self.assertIn("--influxdb-enable", command)
 
     def test_gzip_dataset_is_streamed_to_loader_stdin(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
