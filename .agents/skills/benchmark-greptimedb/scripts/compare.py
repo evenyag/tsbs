@@ -88,6 +88,7 @@ def run_for_comparison(run_dir: Path) -> dict[str, Any]:
         "database_id": target.get("database_id"),
         "version": target["version"],
         "binary_sha256": target["binary_sha256"],
+        "config_file": target.get("config_file"),
         "manifest_sha256": sha256_file(run_dir / "manifest.json"),
         "identity": identity,
         "queries": queries,
@@ -95,7 +96,7 @@ def run_for_comparison(run_dir: Path) -> dict[str, Any]:
 
 
 def run_identity(run: dict[str, Any]) -> dict[str, Any]:
-    return {key: run[key] for key in ("path", "run_id", "database_id", "version", "binary_sha256", "manifest_sha256")}
+    return {key: run[key] for key in ("path", "run_id", "database_id", "version", "binary_sha256", "config_file", "manifest_sha256")}
 
 
 def compare_candidate(baseline: dict[str, Any], candidate: dict[str, Any]) -> dict[str, Any]:
@@ -150,12 +151,19 @@ def render_markdown(summary: dict[str, Any]) -> str:
     lines = [
         f"# GreptimeDB version comparison: {summary['comparison_id']}", "",
         f"- Baseline: `{baseline['version']}` (`{baseline['run_id']}`)",
-        f"- Baseline run: `{baseline['path']}`", "",
+        f"- Baseline run: `{baseline['path']}`",
     ]
+    if baseline.get("config_file"):
+        lines.append(f"- Baseline GreptimeDB config: `{baseline['config_file']}`")
+    lines.append("")
     for candidate in summary["candidates"]:
         lines.extend([
             f"## Candidate `{candidate['version']}` (`{candidate['run_id']}`)", "",
             f"- Candidate run: `{candidate['path']}`",
+        ])
+        if candidate.get("config_file"):
+            lines.append(f"- Candidate GreptimeDB config: `{candidate['config_file']}`")
+        lines.extend([
             f"- Improved: {candidate['counts']['improved']}; unchanged: {candidate['counts']['unchanged']}; regressed: {candidate['counts']['regressed']}", "",
             "| Query type | Baseline (ms) | Candidate (ms) | Delta (ms) | Delta (%) | Latency ratio | Result |",
             "| --- | ---: | ---: | ---: | ---: | ---: | --- |",

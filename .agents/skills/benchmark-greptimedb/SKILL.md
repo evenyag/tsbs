@@ -56,6 +56,10 @@ python3 .agents/skills/benchmark-greptimedb/scripts/benchmark.py query \
 python3 .agents/skills/benchmark-greptimedb/scripts/benchmark.py analyze \
   --profile smoke --database-id loaded-db --hot-runs 2
 
+python3 .agents/skills/benchmark-greptimedb/scripts/benchmark.py query \
+  --database-id loaded-db \
+  --greptime-config .benchmarks/greptimedb/configs/scan-1024.toml
+
 python3 .agents/skills/benchmark-greptimedb/scripts/benchmark.py compare \
   --baseline-run .benchmarks/greptimedb/runs/BASELINE_RUN \
   --candidate-run .benchmarks/greptimedb/runs/CANDIDATE_RUN
@@ -63,6 +67,37 @@ python3 .agents/skills/benchmark-greptimedb/scripts/benchmark.py compare \
 python3 .agents/skills/benchmark-greptimedb/scripts/benchmark.py summarize \
   --run-dir .benchmarks/greptimedb/runs/RUN_ID
 ```
+
+### Custom managed configuration
+
+When the user requests GreptimeDB settings but does not provide a TOML file,
+read GreptimeDB's official [standalone example](https://github.com/GreptimeTeam/greptimedb/blob/main/config/standalone.example.toml)
+before writing the config. The full set of examples is in the upstream
+[config directory](https://github.com/GreptimeTeam/greptimedb/tree/main/config).
+For a release runtime, replace `main` in the standalone URL with the exact
+`vVERSION` tag selected by the prepared workspace or `--greptime-version`.
+Use `main` only for a main or nightly runtime; if the matching release template
+is unavailable, report that instead of silently consulting a different
+version.
+
+Create a minimal file under
+`.benchmarks/greptimedb/configs/DESCRIPTIVE_NAME.toml` containing only the
+requested overrides, with the same table nesting and value types as the
+matching upstream example. Do not copy all default settings. For example:
+
+```toml
+[[region_engine]]
+[region_engine.mito]
+max_concurrent_scan_files = 1024
+```
+
+Pass the file with `--greptime-config`. It is a live source file: the run
+records its resolved path but does not copy or checksum-pin its contents, and
+later starts read its current contents. Resuming the same run without the flag
+reuses the recorded path; selecting another path requires a new run. The
+runner's CLI values for HTTP address, InfluxDB enablement, data home, and log
+directory override conflicting values in the TOML. Custom configs apply only
+to managed targets, not `--endpoint`.
 
 Repeat `--query-type` to define query-set membership; omit it for every type
 allowed by `--query-scope full|fixed-host` (default `full`). The fixed-host
@@ -110,7 +145,8 @@ baseline and one or more repeated `--candidate-run` paths. Comparison requires
 managed targets, complete successful query results, and identical SQL database,
 dataset identity/checksum, query-set identity/checksum, membership, query
 counts, and repetitions. Database IDs may differ. A valid comparison is
-report-only and succeeds even when candidates regress.
+report-only and succeeds even when candidates regress. Custom config paths may
+differ and are reported rather than treated as comparison compatibility fields.
 
 Query and analysis commands prepare logical dataset metadata without generating data.
 Use `--dataset-id` or `--dataset-path` to pin a dataset. Shared query sets live
@@ -144,7 +180,8 @@ directly into the loader without a temporary plain file.
 ## Report results
 
 Read `summary.json` and report the dataset ID and checksum, query-set ID and
-manifest checksum, database ID or external target, metrics/second and
+manifest checksum, database ID or external target, custom config path when
+present, metrics/second and
 rows/second for ingestion, weighted mean latency per query type, failures and
 their log paths, and the run directory. Preserve failed-run diagnostics.
 For analysis, also report each query type's attempt and cold/hot result paths,

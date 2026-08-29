@@ -101,6 +101,8 @@ def render_markdown(summary: dict[str, Any]) -> str:
         if target.get("binary_sha256"):
             label = "Runtime GreptimeDB binary SHA-256" if target.get("version_override") else "GreptimeDB binary SHA-256"
             lines.append(f"- {label}: `{target.get('binary_sha256')}`")
+        if target.get("config_file"):
+            lines.append(f"- GreptimeDB config file: `{target.get('config_file')}`")
         if target.get("version_override"):
             lines.append(f"- Workspace-bound GreptimeDB version: `{target.get('workspace_version')}`")
             lines.append(f"- Workspace-bound binary SHA-256: `{target.get('workspace_binary_sha256')}`")
