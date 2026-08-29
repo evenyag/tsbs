@@ -805,16 +805,19 @@ def managed_process(
 
 
 @contextlib.contextmanager
-def connection(args: argparse.Namespace, run_dir: Path, existing_target: dict[str, Any] | None = None) -> Iterator[tuple[str, bool, dict[str, Any] | None, Path | None, dict[str, Any]]]:
+def connection(args: argparse.Namespace, run_dir: Path, manifest: dict[str, Any]) -> Iterator[tuple[str, bool, dict[str, Any] | None, Path | None]]:
+    existing_target = manifest.get("target")
     if args.endpoint:
         endpoint = args.endpoint.rstrip("/")
         target = {"mode": "external", "endpoint": endpoint, "database": args.database, "database_id": None, "version": None, "binary_sha256": None}
         if existing_target and not target_matches(existing_target, target):
             raise BenchmarkError("run target is immutable; create a new run for another GreptimeDB version or target")
-        yield endpoint, False, None, None, target; return
+        manifest["target"] = target; save_manifest(run_dir, manifest)
+        yield endpoint, False, None, None; return
     with managed_workspace(args, existing_target) as (workspace, database_manifest, binary, config_file, target):
+        manifest["target"] = target; save_manifest(run_dir, manifest)
         with managed_process(args, workspace, binary, run_dir / "logs" / "greptimedb-process.log", config_file) as endpoint:
-            yield endpoint, True, database_manifest, workspace, target
+            yield endpoint, True, database_manifest, workspace
 
 
 def add_run_options(parser: argparse.ArgumentParser) -> None:
@@ -904,8 +907,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             if args.only in ("all", "data"): generate_data(args, run_dir, manifest)
             if args.only in ("all", "queries"): generate_queries(args, run_dir, manifest)
         elif args.command in ("load", "query", "all"):
-            with connection(args, run_dir, manifest.get("target")) as (endpoint, managed, database_manifest, database_path, target):
-                manifest["target"] = target; save_manifest(run_dir, manifest)
+            with connection(args, run_dir, manifest) as (endpoint, managed, database_manifest, database_path):
                 if args.command in ("load", "all"): load_data(args, run_dir, manifest, endpoint, managed, database_manifest, database_path)
                 if args.command in ("query", "all"): run_queries(args, run_dir, manifest, endpoint, database_manifest)
         elif args.command == "analyze":

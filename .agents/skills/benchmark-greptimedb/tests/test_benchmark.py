@@ -673,6 +673,47 @@ class ManagedDatabaseTests(unittest.TestCase):
             legacy_target = {key: target[key] for key in ("mode", "endpoint", "database", "database_id", "version", "binary_sha256")}
             self.assertFalse(benchmark.target_matches(legacy_target, target))
 
+    def test_connection_persists_config_before_startup_failure_and_reuses_it(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp); run_dir = root / "run"; (run_dir / "logs").mkdir(parents=True)
+            config = root / "standalone.toml"; config.write_text("max_concurrent_queries = 1\n", encoding="utf-8")
+            database_root = root / "databases"
+            parser = benchmark.make_parser()
+            args = parser.parse_args([
+                "query", "--greptime-bin", sys.executable, "--database-id", "db-a",
+                "--database-root", str(database_root), "--greptime-config", str(config),
+            ])
+            benchmark.resolve_database(args); benchmark.validate_args(args)
+            manifest = {"events": {"loads": [], "queries": [], "analyses": []}}
+            benchmark.save_manifest(run_dir, manifest)
+
+            with mock.patch.object(
+                benchmark, "managed_process", side_effect=benchmark.BenchmarkError("startup failed")
+            ) as process:
+                with self.assertRaisesRegex(benchmark.BenchmarkError, "startup failed"):
+                    with benchmark.connection(args, run_dir, manifest):
+                        pass
+
+            resolved_config = config.resolve()
+            self.assertEqual(process.call_args.args[4], resolved_config)
+            saved = benchmark.read_json(run_dir / "manifest.json")
+            self.assertEqual(saved["target"]["config_file"], str(resolved_config))
+
+            resumed = parser.parse_args([
+                "query", "--greptime-bin", sys.executable, "--database-id", "db-a",
+                "--database-root", str(database_root),
+            ])
+            benchmark.resolve_database(resumed); benchmark.validate_args(resumed)
+            with mock.patch.object(
+                benchmark, "managed_process", side_effect=benchmark.BenchmarkError("startup failed again")
+            ) as resumed_process:
+                with self.assertRaisesRegex(benchmark.BenchmarkError, "startup failed again"):
+                    with benchmark.connection(resumed, run_dir, saved):
+                        pass
+
+            self.assertEqual(resumed_process.call_args.args[4], resolved_config)
+            self.assertEqual(benchmark.read_json(run_dir / "manifest.json")["target"]["config_file"], str(resolved_config))
+
     def test_config_file_rejects_invalid_paths_and_external_targets(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
