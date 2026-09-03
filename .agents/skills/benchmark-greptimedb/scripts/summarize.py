@@ -106,6 +106,12 @@ def render_markdown(summary: dict[str, Any]) -> str:
             lines.append(f"- GreptimeDB binary path: `{target.get('binary_path')}`")
         if target.get("config_file"):
             lines.append(f"- GreptimeDB config file: `{target.get('config_file')}`")
+        storage = target.get("storage", {"type": "file"})
+        lines.append(f"- Storage: `{storage.get('type')}`")
+        if storage.get("type") == "s3":
+            lines.append(f"- S3 location: `{storage.get('bucket')}/{storage.get('root')}`")
+            if storage.get("endpoint"):
+                lines.append(f"- S3 endpoint: `{storage.get('endpoint')}`")
         if runtime_override:
             lines.append(f"- Workspace-bound GreptimeDB version: `{target.get('workspace_version')}`")
             lines.append(f"- Workspace-bound binary SHA-256: `{target.get('workspace_binary_sha256')}`")
