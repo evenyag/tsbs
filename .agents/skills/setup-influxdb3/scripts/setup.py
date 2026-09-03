@@ -117,9 +117,14 @@ def read_aws_credentials(path: Path) -> tuple[Path, tuple[str, ...]]:
     for key in ("aws_access_key_id", "aws_secret_access_key"):
         if not isinstance(document.get(key), str) or not document[key]:
             raise SetupError(f"InfluxDB S3 credentials file requires nonempty {key}")
-    for key in ("aws_session_token", "expiry"):
-        if key in document and not isinstance(document[key], (str, int)):
-            raise SetupError(f"InfluxDB S3 credentials field {key} has an invalid type")
+    if "aws_session_token" in document and not isinstance(document["aws_session_token"], str):
+        raise SetupError("InfluxDB S3 credentials field aws_session_token must be a string")
+    if "expiry" in document and (
+        isinstance(document["expiry"], bool)
+        or not isinstance(document["expiry"], int)
+        or not 0 <= document["expiry"] <= 2**64 - 1
+    ):
+        raise SetupError("InfluxDB S3 credentials field expiry must be an unsigned 64-bit integer")
     secrets = tuple(
         str(document[key])
         for key in ("aws_access_key_id", "aws_secret_access_key", "aws_session_token")

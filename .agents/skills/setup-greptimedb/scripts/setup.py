@@ -19,7 +19,6 @@ import subprocess
 import sys
 import tarfile
 import tempfile
-import tomllib
 import urllib.error
 import urllib.request
 from pathlib import Path, PurePosixPath
@@ -27,6 +26,11 @@ from typing import Any, Iterator, Sequence
 
 
 SCRIPT_PATH = Path(__file__).resolve()
+sys.path.insert(0, str(SCRIPT_PATH.parents[3] / "lib"))
+
+import tomli  # noqa: E402
+
+
 REPO_ROOT = SCRIPT_PATH.parents[4]
 DEFAULT_ROOT = REPO_ROOT / ".benchmarks" / "greptimedb"
 DEFAULT_INSTALL_ROOT = DEFAULT_ROOT / "installations"
@@ -111,10 +115,10 @@ def read_greptime_storage_config(path: Path, *, require_credentials: bool = True
     path = path.expanduser().resolve()
     try:
         with path.open("rb") as stream:
-            document = tomllib.load(stream)
+            document = tomli.load(stream)
     except FileNotFoundError as exc:
         raise SetupError(f"GreptimeDB config file does not exist: {path}") from exc
-    except tomllib.TOMLDecodeError as exc:
+    except tomli.TOMLDecodeError as exc:
         raise SetupError(f"invalid GreptimeDB TOML config {path}: {exc}") from exc
     storage = document.get("storage")
     if not isinstance(storage, dict):

@@ -85,6 +85,26 @@ class SummaryIntegrationTests(unittest.TestCase):
         self.assertIn("GreptimeDB config file: `/configs/scan.toml`", rendered)
         self.assertIn("set-a", rendered)
 
+    def test_external_target_storage_is_rendered_as_unknown(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            summary = summarize.build_summary(
+                Path(temp),
+                {
+                    "run_id": "run",
+                    "profile": "smoke",
+                    "database": "benchmark",
+                    "target": {
+                        "mode": "external",
+                        "endpoint": "http://localhost:4000",
+                    },
+                    "events": {"loads": [], "queries": []},
+                },
+            )
+
+        rendered = summarize.render_markdown(summary)
+        self.assertIn("Storage: `unknown`", rendered)
+        self.assertNotIn("Storage: `file`", rendered)
+
     def test_version_override_identity_is_rendered(self) -> None:
         summary = {
             "run_id": "run", "profile": "smoke", "database": "benchmark",

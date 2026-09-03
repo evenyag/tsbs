@@ -235,6 +235,19 @@ class DatabaseTests(unittest.TestCase):
         with mock.patch.object(setup, "port_available", side_effect=[False, True]), mock.patch.object(setup.time, "sleep"):
             self.assertTrue(setup.wait_port_available(8181))
 
+    def test_s3_credentials_reject_server_incompatible_optional_types(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            credentials = Path(temp) / "aws.json"
+            required = {
+                "aws_access_key_id": "access-value",
+                "aws_secret_access_key": "secret-value",
+            }
+            for field, value in (("aws_session_token", 123), ("expiry", "123")):
+                with self.subTest(field=field):
+                    credentials.write_text(json.dumps({**required, field: value}), encoding="utf-8")
+                    with self.assertRaisesRegex(setup.SetupError, field):
+                        setup.read_aws_credentials(credentials)
+
     def test_s3_credentials_are_private_and_not_persisted_in_workspace(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp); credentials = root / "aws.json"

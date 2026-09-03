@@ -133,6 +133,28 @@ class SummaryIntegrationTests(unittest.TestCase):
         self.assertIn("managed:db-a", rendered)
         self.assertIn("set-a", rendered)
 
+    def test_external_target_storage_is_rendered_as_unknown(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            summary = summarize.build_summary(
+                Path(temp),
+                {
+                    "run_id": "run",
+                    "profile": "smoke",
+                    "database": "benchmark",
+                    "target": {
+                        "mode": "external",
+                        "urls": ["http://localhost:8181"],
+                        "edition": "core",
+                        "storage": None,
+                    },
+                    "events": {"loads": [], "queries": [], "servers": []},
+                },
+            )
+
+        rendered = summarize.render_markdown(summary)
+        self.assertIn("Storage: `unknown`", rendered)
+        self.assertNotIn("Storage: `file`", rendered)
+
 
 class QuerySetIdentityTests(unittest.TestCase):
     def dataset(self) -> dict:
@@ -442,6 +464,19 @@ class ManagedDatabaseTests(unittest.TestCase):
             persisted = json.loads((path / "manifest.json").read_text(encoding="utf-8"))
             self.assertIsNone(persisted["database"])
             self.assertIsNone(persisted["binding"])
+
+    def test_s3_credentials_reject_server_incompatible_optional_types(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            credentials = Path(temp) / "aws.json"
+            required = {
+                "aws_access_key_id": "access-value",
+                "aws_secret_access_key": "secret-value",
+            }
+            for field, value in (("aws_session_token", 123), ("expiry", "123")):
+                with self.subTest(field=field):
+                    credentials.write_text(json.dumps({**required, field: value}), encoding="utf-8")
+                    with self.assertRaisesRegex(benchmark.BenchmarkError, field):
+                        benchmark.read_aws_credentials(credentials)
 
     def test_s3_managed_connection_uses_credentials_file_and_scrubs_logs(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

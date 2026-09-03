@@ -16,7 +16,6 @@ import subprocess
 import sys
 import tempfile
 import time
-import tomllib
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -25,6 +24,8 @@ from typing import Any, Iterator, Sequence
 
 SCRIPT_PATH = Path(__file__).resolve()
 sys.path.insert(0, str(SCRIPT_PATH.parents[3] / "lib"))
+
+import tomli  # noqa: E402
 
 from tsbs_benchmark import (  # noqa: E402
     FIXED_HOST_QUERY_TYPES,
@@ -575,8 +576,8 @@ def resolve_greptime_config(
 def config_storage(path: Path) -> tuple[dict[str, Any], tuple[str, ...]]:
     try:
         with path.open("rb") as stream:
-            document = tomllib.load(stream)
-    except tomllib.TOMLDecodeError as exc:
+            document = tomli.load(stream)
+    except tomli.TOMLDecodeError as exc:
         raise BenchmarkError(f"invalid GreptimeDB TOML config {path}: {exc}") from exc
     storage = document.get("storage")
     if storage is None:

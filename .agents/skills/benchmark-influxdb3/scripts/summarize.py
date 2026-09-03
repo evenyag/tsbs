@@ -138,9 +138,12 @@ def render_markdown(summary: dict[str, Any]) -> str:
         lines.append(f"- Edition: `{target.get('edition')}`")
         if target.get("version"):
             lines.append(f"- Version: `{target.get('version')}`")
-        storage = target.get("storage", {"type": "file"})
-        lines.append(f"- Storage: `{storage.get('type')}`")
-        if storage.get("type") == "s3":
+        storage = target.get("storage")
+        if storage is None and target.get("mode") == "managed":
+            storage = {"type": "file"}
+        storage_type = storage.get("type") if isinstance(storage, dict) else "unknown"
+        lines.append(f"- Storage: `{storage_type}`")
+        if storage_type == "s3":
             lines.append(f"- S3 bucket: `{storage.get('bucket')}`")
             if storage.get("endpoint"):
                 lines.append(f"- S3 endpoint: `{storage.get('endpoint')}`")
